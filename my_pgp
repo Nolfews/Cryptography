@@ -1,0 +1,416 @@
+#!/usr/bin/python3
+import sys
+import rsa
+import pgp
+from aes import key_expansion, cipher_block, inv_cipher_block, pad_block, hex_from_bytes, bytes_from_hex, hex_from_bytes_le, bytes_from_hex_le
+from xor import pad_block as xor_pad_block, bytes_from_hex as xor_bytes_from_hex, hex_from_bytes as xor_hex_from_bytes, xor_block as xor_block, hex_from_bytes_le as xor_hex_from_bytes_le, bytes_from_hex_le as xor_bytes_from_hex_le
+
+def xor_process_stream_encrypt(key_hex: str, infile, outfile) -> None:
+    key = xor_bytes_from_hex_le(key_hex)
+    if len(key) == 0:
+        raise ValueError("Key must not be empty")
+
+    block_size = len(key)
+    data = infile.read()
+    if isinstance(data, str):
+        if data.endswith('\n'):
+            data = data[:-1]
+        data = data.encode('utf-8')
+    else:
+        if data.endswith(b'\n'):
+            data = data[:-1]
+
+    pos = 0
+    write_binary = getattr(outfile, 'buffer', None)
+    out_parts = []
+
+    for offset in range(0, len(data), block_size):
+        chunk = data[offset:offset+block_size]
+        orig_len = len(chunk)
+        padded = False
+        if orig_len < block_size:
+            chunk = xor_pad_block(chunk, block_size)
+            padded = True
+
+        ct = bytes([b ^ key[(pos + i) % len(key)] for i, b in enumerate(chunk)])
+
+        write_len = orig_len if padded else len(ct)
+        pos += write_len
+        out_parts.append(xor_hex_from_bytes_le(ct[:write_len]))
+
+    full_hex = ''.join(out_parts)
+    try:
+        if write_binary is not None:
+            outfile.buffer.write(full_hex.encode('utf-8'))
+            outfile.buffer.write(b'\n')
+        else:
+            outfile.write(full_hex)
+            outfile.write('\n')
+    except Exception:
+        try:
+            outfile.write(full_hex)
+            outfile.write('\n')
+        except Exception:
+            pass
+
+
+def xor_process_stream_decrypt(key_hex: str, infile, outfile) -> None:
+    key = xor_bytes_from_hex_le(key_hex)
+    if len(key) == 0:
+        raise ValueError("Key must not be empty")
+
+    block_size = len(key)
+    data = infile.read()
+
+    if isinstance(data, bytes):
+        data = data.decode('utf-8')
+
+    data = data.strip()
+
+    out_bytes = bytearray()
+    pos = 0
+
+    i = 0
+    while i < len(data):
+        blk_hex = data[i:i + block_size * 2]
+        blk = bytes.fromhex(blk_hex)
+        blk = blk[::-1]
+
+        pt = bytes([b ^ key[(pos + j) % len(key)] for j, b in enumerate(blk)])
+        pos += len(blk)
+        out_bytes += pt
+        i += block_size * 2
+
+    try:
+        if getattr(outfile, 'buffer', None) is not None:
+            outfile.buffer.write(out_bytes.rstrip(b"\x00"))
+            try:
+                outfile.buffer.write(b'\n')
+            except Exception:
+                pass
+        else:
+            outfile.write(out_bytes.rstrip(b"\x00").decode('utf-8', errors='ignore'))
+            try:
+                outfile.write('\n')
+            except Exception:
+                pass
+    except Exception:
+        outfile.write(out_bytes.rstrip(b"\x00").decode('utf-8', errors='ignore'))
+        try:
+            outfile.write('\n')
+        except Exception:
+            pass
+
+def process_stream_encrypt(key_hex: str, infile, outfile):
+    key = bytes_from_hex_le(key_hex)
+    round_keys = key_expansion(key)
+    parts = []
+    data = infile.read()
+    if isinstance(data, str):
+        data = data.encode('utf-8')
+    if data.endswith(b'\n'):
+        data = data[:-1]
+    for offset in range(0, len(data), 16):
+        chunk = data[offset:offset+16]
+        if len(chunk) < 16:
+            chunk = pad_block(chunk)
+        ct = cipher_block(chunk, round_keys)
+        ct_le = b''
+        for i in range(0, 16, 4):
+            ct_le += ct[i:i+4][::-1]
+        parts.append(ct_le.hex())
+
+    full = ''.join(parts)
+    try:
+        outfile.write(full)
+        outfile.write('\n')
+    except Exception:
+        try:
+            outb = getattr(outfile, 'buffer', None)
+            if outb is not None:
+                outb.write(full.encode('utf-8'))
+                outb.write(b'\n')
+        except Exception:
+            pass
+
+def process_stream_decrypt(key_hex: str, infile, outfile):
+    key = bytes_from_hex_le(key_hex)
+    round_keys = key_expansion(key)
+    data = infile.read().strip()
+
+    if isinstance(data, bytes):
+        data = data.decode('utf-8')
+    out_bytes = bytearray()
+
+    for i in range(0, len(data), 32):
+        blk_hex = data[i:i+32]
+        if len(blk_hex) < 32:
+            blk_hex = blk_hex.ljust(32, '0')
+        blk = bytes.fromhex(blk_hex)
+        blk_be = b''
+        for j in range(0, 16, 4):
+            blk_be += blk[j:j+4][::-1]
+        pt = inv_cipher_block(blk_be, round_keys)
+        out_bytes += pt
+
+    try:
+        outfile.write(out_bytes.rstrip(b"\x00").decode('utf-8', errors='ignore'))
+        try:
+            outfile.write('\n')
+        except Exception:
+            pass
+    except Exception:
+        try:
+            outb = getattr(outfile, 'buffer', None)
+            if outb is not None:
+                outb.write(out_bytes.rstrip(b"\x00"))
+                outb.write(b'\n')
+            else:
+                outfile.write(out_bytes.rstrip(b"\x00").decode('utf-8', errors='ignore'))
+                outfile.write('\n')
+        except Exception:
+            pass
+
+def main(argv):
+    if len(argv) >= 2 and argv[1] == '-h':
+        try:
+            with open('usage.txt', 'r', encoding='utf-8') as f:
+                sys.stdout.write(f.read())
+            return 0
+        except FileNotFoundError:
+            print("Usage file not found.")
+            return 84
+    elif len(argv) >= 2 and argv[1] == "aes":
+        mode = None
+        key_hex = None
+        i = 2
+
+        while i < len(argv):
+            if argv[i] == '-c':
+                mode = 'enc'
+            elif argv[i] == '-d':
+                mode = 'dec'
+            elif argv[i] == '-b':
+                if i+1 < len(argv):
+                    key_hex = argv[i+1]
+                    i += 1
+                else:
+                    return 84
+            elif argv[i] == '-g':
+                return 84
+            else:
+                return 84
+            i += 1
+
+        if mode is None:
+            print("Invalid arguments in aes. Use -h for help.")
+            return 84
+
+        if key_hex is not None:
+            try:
+                bytes.fromhex(key_hex)
+            except ValueError:
+                return 84
+
+        if key_hex is None:
+            inp = sys.stdin.buffer
+            outb = getattr(sys.stdout, 'buffer', None)
+            while True:
+                chunk = inp.read(8192)
+                if not chunk:
+                    break
+                if outb is not None:
+                    outb.write(chunk)
+                else:
+                    sys.stdout.write(chunk.decode('utf-8', errors='ignore'))
+        else:
+            try:
+                if mode == 'enc':
+                    process_stream_encrypt(key_hex, sys.stdin.buffer, sys.stdout)
+                else:
+                    process_stream_decrypt(key_hex, sys.stdin.buffer, sys.stdout)
+            except (ValueError, AssertionError, Exception):
+                return 84
+        return 0
+    elif len(argv) >= 2 and argv[1] == "rsa":
+        try:
+            if len(argv) < 3:
+                print("Invalid RSA arguments. Use -h for help.")
+                return 84
+            sub = argv[2]
+            if sub in ("-d", "-c"):
+                if len(argv) < 4:
+                    print("Invalid RSA arguments. Missing key.")
+                    return 84
+                if '-' not in argv[3]:
+                    print("Invalid RSA key format. Expected a-b hex.")
+                    return 84
+                a_str, b_str = argv[3].split('-', 1)
+                if sub == "-d":
+                    rsa.stream_rsa_decrypt((a_str, b_str), sys.stdin, sys.stdout)
+                else:
+                    rsa.stream_rsa_encrypt((a_str, b_str), sys.stdin, sys.stdout)
+            elif sub == "-g":
+                if len(argv) < 5:
+                    print("Invalid RSA keygen arguments. Expected two hex primes.")
+                    return 84
+                rsa.generate_keys_from_hex(argv[3], argv[4], verbose=True)
+            else:
+                print("Invalid RSA arguments. Use -h for help.")
+                return 84
+        except SystemExit as e:
+            # Propagate our standardized exit code
+            return 84 if e.code != 0 else 0
+        except Exception as e:
+            print(f"Error processing rsa command: {e}")
+            return 84
+
+        return 0
+
+    elif len(argv) >= 2 and argv[1] == "pgp-xor":
+        mode = None
+        key_hex = None
+        one_block = False
+        i = 2
+
+        while i < len(argv):
+            if argv[i] == '-c':
+                mode = 'enc'
+            elif argv[i] == '-d':
+                mode = 'dec'
+            elif argv[i] == '-b':
+                if i+1 < len(argv):
+                    one_block = True
+                    key_hex = argv[i+1]
+                    i += 1
+                else:
+                    return 84
+            elif argv[i] == '-g':
+                print("Invalid arguments in pgp-xor. Use -h for help.")
+                return 84
+            else:
+                # Argument inconnu
+                print("Invalid arguments in pgp-xor. Use -h for help.")
+                return 84
+            i += 1
+
+        if mode is None or key_hex is None:
+            print("Invalid arguments in pgp-xor. Use -h for help.")
+            return 84
+
+        try:
+            if mode == 'enc':
+                sym_key_hex, rsa_key_hex = key_hex.split(':')
+                pgp.pgp_xor_encrypt(sym_key_hex, rsa_key_hex, sys.stdin.buffer, sys.stdout)
+            else: # dec
+                encrypted_sym_key_hex, rsa_key_hex = key_hex.split(':')
+                pgp.pgp_xor_decrypt(encrypted_sym_key_hex, rsa_key_hex, sys.stdin.buffer, sys.stdout)
+        except (ValueError, IndexError) as e:
+            print(f"Error processing pgp-xor command: {e}")
+            return 84
+        return 0
+
+    elif len(argv) >= 2 and argv[1] == "pgp-aes":
+        mode = None
+        key_hex = None
+        one_block = False
+        i = 2
+
+        while i < len(argv):
+            if argv[i] == '-c':
+                mode = 'enc'
+            elif argv[i] == '-d':
+                mode = 'dec'
+            elif argv[i] == '-b':
+                if i+1 < len(argv):
+                    one_block = True
+                    key_hex = argv[i+1]
+                    i += 1
+                else:
+                    return 84
+            elif argv[i] == '-g':
+                print("Invalid arguments in pgp-aes. Use -h for help.")
+                return 84
+            else:
+                # Argument inconnu
+                print("Invalid arguments in pgp-aes. Use -h for help.")
+                return 84
+            i += 1
+
+        if mode is None or key_hex is None:
+            print("Invalid arguments in pgp-aes. Use -h for help.")
+            return 84
+
+        try:
+            if mode == 'enc':
+                sym_key_hex, rsa_key_hex = key_hex.split(':')
+                pgp.pgp_aes_encrypt(sym_key_hex, rsa_key_hex, sys.stdin.buffer, sys.stdout, one_block=one_block)
+            else: # dec
+                encrypted_sym_key_hex, rsa_key_hex = key_hex.split(':')
+                pgp.pgp_aes_decrypt(encrypted_sym_key_hex, rsa_key_hex, sys.stdin.buffer, sys.stdout, one_block=one_block)
+        except (ValueError, IndexError) as e:
+            print(f"Error processing pgp-aes command: {e} for arg {key_hex}")
+            return 84
+        return 0
+    elif len(argv) >= 2 and argv[1] == "xor":
+        mode = None
+        key_hex = None
+        i = 2
+
+        while i < len(argv):
+            if argv[i] == '-c':
+                mode = 'enc'
+            elif argv[i] == '-d':
+                mode = 'dec'
+            elif argv[i] == '-b':
+                if i+1 < len(argv):
+                    key_hex = argv[i+1]
+                    i += 1
+                else:
+                    return 84
+            elif argv[i] == '-g':
+                print("Invalid arguments in xor. Use -h for help.")
+                return 84
+            else:
+                print("Invalid arguments in xor. Use -h for help.")
+                return 84
+            i += 1
+
+        if mode is None:
+            print("Invalid arguments in xor. Use -h for help.")
+            return 84
+
+        if key_hex is not None:
+            try:
+                bytes.fromhex(key_hex)
+            except ValueError:
+                return 84
+
+        try:
+            if key_hex is None:
+                inp = sys.stdin.buffer
+                outb = getattr(sys.stdout, 'buffer', None)
+                while True:
+                    chunk = inp.read(8192)
+                    if not chunk:
+                        break
+                    if outb is not None:
+                        outb.write(chunk)
+                    else:
+                        sys.stdout.write(chunk.decode('utf-8', errors='ignore'))
+            else:
+                if mode == 'enc':
+                    xor_process_stream_encrypt(key_hex, sys.stdin.buffer, sys.stdout)
+                else:
+                    xor_process_stream_decrypt(key_hex, sys.stdin.buffer, sys.stdout)
+        except ValueError as e:
+            print(str(e))
+            return 84
+
+        return 0
+    else:
+        print("Invalid arguments in main. Use -h for help.")
+    return 84
+
+if __name__ == '__main__':
+    raise SystemExit(main(sys.argv))

@@ -1,0 +1,1 @@
+python3 -m pytest -vv tests/tests_aes.py tests/tests_xor.py -q
